@@ -25,6 +25,8 @@ type options[K comparable, V any] struct {
 	maxCost           uint64
 	ttl               time.Duration
 	loader            Loader[K, V]
+	valueLoader       ValueLoader[K, V]
+	generationGuard   bool
 	disableTouchOnHit bool
 	itemOpts          []ItemOption[K, V]
 }
@@ -73,6 +75,44 @@ func WithVersion[K comparable, V any](enable bool) Option[K, V] {
 func WithLoader[K comparable, V any](l Loader[K, V]) Option[K, V] {
 	return optionFunc[K, V](func(opts options[K, V]) options[K, V] {
 		opts.loader = l
+		return opts
+	})
+}
+
+// WithValueLoader sets a context-aware loader used by GetMany when an
+// item is missing. Unlike with WithLoader, the cache inserts the loaded
+// value itself, which allows load errors to be reported and the
+// generation guard (WithGenerationGuard) to prevent stale loads from
+// being written back.
+//
+// When both a Loader and a ValueLoader are configured, GetMany uses the
+// ValueLoader. The single-key Get method ignores the ValueLoader and
+// keeps using the Loader.
+//
+// When passed to GetMany via GetManyOptions.Options, it sets an
+// ephemeral value loader used instead of the cache-wide one.
+func WithValueLoader[K comparable, V any](l ValueLoader[K, V]) Option[K, V] {
+	return optionFunc[K, V](func(opts options[K, V]) options[K, V] {
+		opts.valueLoader = l
+		return opts
+	})
+}
+
+// WithGenerationGuard enables generation-aware insertion for values
+// loaded by ValueLoaders through GetMany.
+//
+// When enabled, a value is not inserted when the cache generation
+// changed since the load started (DeleteAll, a restart after Stop, or
+// ResetGeneration) or when the key was concurrently set or deleted. The
+// loaded value is still returned to the callers that waited for the
+// load, as a detached item that is not stored in the cache.
+//
+// Plain Loaders (WithLoader) keep their legacy behavior regardless of
+// this option, because they insert values themselves. The single-key
+// Get method is not affected.
+func WithGenerationGuard[K comparable, V any]() Option[K, V] {
+	return optionFunc[K, V](func(opts options[K, V]) options[K, V] {
+		opts.generationGuard = true
 		return opts
 	})
 }

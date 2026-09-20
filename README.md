@@ -10,6 +10,9 @@
 - Automatic expiration time extension on each `Get` call (can be disabled)
 - `Loader` interface that may be used to load/lazily initialize missing
   cache items, with optional duplicate call suppression
+- Batch reads via `GetMany`, a context-aware `ValueLoader`, and an
+  optional generation guard that prevents stale loads from replacing a
+  cleared or concurrently updated cache
 - Capacity limits based on the number of items or their custom-calculated cost
 - Event handlers (insertion, update, and eviction)
 - Metrics
@@ -174,6 +177,87 @@ func main() {
 	item := cache.Get("key from file")
 }
 ```
+
+### Batch reads with `GetMany`
+`GetMany` retrieves an ordered list of keys in a single call, with
+per-key options and an upper bound on concurrent load executions:
+```go
+results := cache.GetMany(ctx,
+	[]string{"user:1", "user:2", "user:1"},
+	&ttlcache.GetManyOptions[string, string]{
+		MaxConcurrency: 8,
+	},
+)
+// results is aligned with the input: results[0] and results[2] share the
+// same item because "user:1" is looked up and loaded at most once.
+for _, r := range results {
+	if r.Miss() {
+		// not found
+	} else if r.Err != nil {
+		// loader error
+	} else {
+		_ = r.Item.Value()
+	}
+}
+```
+
+Semantics:
+- Results are aligned by position. Each unique key is looked up and
+  loaded at most once per call; the same `*Item` is returned for every
+  repeated position.
+- The hit/miss decision, touches and hit/miss metrics are a snapshot
+  taken while the keys are first examined, in first-occurrence order.
+  Loaded values, load errors, insertion/update metrics and evictions
+  caused by an insertion are decided when each load completes, so the
+  relative order of effects for different keys is unspecified under
+  concurrency.
+- When the passed context is canceled, no new loads are started and
+  unresolved results report the context error. A load shared with other
+  callers is not canceled because one waiter gave up; it is canceled
+  only after every waiter abandons it.
+- `GetMany` coordinates in-flight loads of the same key across calls,
+  matching the singleflight behavior of `NewSuppressedLoader`, and the
+  two compose without nesting deadlocks for different keys.
+
+### ValueLoader and the generation guard
+`ValueLoader` is a context-aware loader used by `GetMany`. Unlike
+`Loader`, it only returns the value and its TTL; the cache performs the
+insertion, so load errors can be reported and stale results can be
+rejected. Return `ttlcache.ErrNotFound` for an ordinary miss:
+```go
+loader := ttlcache.ValueLoaderFunc[string, string](
+	func(ctx context.Context, c *ttlcache.Cache[string, string], key string) (string, time.Duration, error) {
+		if key == "missing" {
+			return "", 0, ttlcache.ErrNotFound
+		}
+		return fetch(ctx, key), ttlcache.DefaultTTL, nil
+	},
+)
+cache := ttlcache.New[string, string](
+	ttlcache.WithValueLoader[string, string](loader),
+	ttlcache.WithGenerationGuard[string, string](),
+)
+```
+
+With `WithGenerationGuard`, the cache keeps a monotonically increasing
+generation that advances on `DeleteAll`, on `Start` after a `Stop`, and
+on explicit `ResetGeneration` calls. A load captures the generation when
+it starts. When it completes, its value is returned to the callers that
+waited for it, but it is not written back when:
+- the generation advanced while the load was in-flight, or
+- the key was concurrently set, deleted or evicted after the lookup
+  snapshot.
+
+The returned item is then a detached item that is not part of the cache.
+A concurrent `Set` of the same key always wins over an in-flight load,
+even within the same generation.
+
+Without the generation guard, the historical last-writer-wins behavior
+is preserved (including across `DeleteAll`/`ResetGeneration`), and a
+plain `Loader` configured with `WithLoader` always keeps its legacy
+behavior: it inserts the value itself, so neither the guard nor
+concurrent sets can prevent its write-back. The single-key `Get` method
+is unaffected by these additions and keeps its existing behavior.
 
 The cache's capacity can also be restricted by criteria other than the
 number of items. The `ttlcache.WithMaxCost()` option assigns each item

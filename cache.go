@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -63,6 +64,18 @@ type Cache[K comparable, V any] struct {
 	stopMu  sync.Mutex
 	stopCh  chan struct{}
 	stopped bool
+	stopWG  sync.WaitGroup
+
+	// gen is the current cache generation. It is incremented on
+	// DeleteAll, when the cleanup process is restarted with Start, and
+	// by ResetGeneration. Loads store the generation captured at their
+	// start and compare it with the current one before inserting when
+	// the generation guard is enabled.
+	gen atomic.Uint64
+
+	// loads deduplicates concurrent ValueLoader executions of the same
+	// key across GetMany calls.
+	loads loadGroup[K, V]
 
 	options options[K, V]
 }
@@ -70,7 +83,7 @@ type Cache[K comparable, V any] struct {
 // New creates a new instance of cache.
 func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
 	c := &Cache[K, V]{
-		stopCh:  make(chan struct{}),
+		stopCh:  make(chan struct{}, 1),
 		stopped: true, // cache cleanup process is stopped by default
 	}
 	c.items.values = make(map[K]*list.Element)
@@ -82,6 +95,7 @@ func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
 	c.events.eviction.fns = make(map[uint64]func(EvictionReason, *Item[K, V]))
 
 	c.options = applyOptions(c.options, opts...)
+	c.gen.Store(1)
 
 	return c
 }
@@ -486,6 +500,32 @@ func (c *Cache[K, V]) DeleteAll() {
 	c.items.mu.Lock()
 	c.evict(EvictionReasonDeleted)
 	c.items.mu.Unlock()
+
+	c.bumpGeneration()
+}
+
+// ResetGeneration advances the cache generation. When the generation
+// guard is enabled (see WithGenerationGuard), values loaded by
+// ValueLoaders that started before the reset are not inserted into the
+// cache; they may still be returned to the callers that waited for the
+// load.
+//
+// When the generation guard is disabled, the method has no observable
+// effect and only the generation counter advances.
+func (c *Cache[K, V]) ResetGeneration() uint64 {
+	return c.bumpGeneration()
+}
+
+// Generation returns the current cache generation. The first generation
+// of a cache is 1.
+func (c *Cache[K, V]) Generation() uint64 {
+	return c.gen.Load()
+}
+
+// bumpGeneration advances the cache generation and returns the new
+// value.
+func (c *Cache[K, V]) bumpGeneration() uint64 {
+	return c.gen.Add(1)
 }
 
 // DeleteExpired deletes all expired items from the cache.
@@ -685,7 +725,17 @@ func (c *Cache[K, V]) Start() {
 	}
 
 	c.stopped = false
+	c.stopWG.Add(1)
+	if c.stopCh == nil {
+		c.stopCh = make(chan struct{}, 1)
+	}
+	stopCh := c.stopCh
 	c.stopMu.Unlock()
+
+	// A restarted cleanup process starts a new generation so that loads
+	// started before Stop do not write into the new cache instance.
+	c.bumpGeneration()
+	defer c.stopWG.Done()
 
 	waitDur := func() time.Duration {
 		c.items.mu.RLock()
@@ -724,7 +774,7 @@ func (c *Cache[K, V]) Start() {
 
 	for {
 		select {
-		case <-c.stopCh:
+		case <-stopCh:
 			return
 		case d := <-c.items.timerCh:
 			stop()
@@ -741,15 +791,30 @@ func (c *Cache[K, V]) Start() {
 // It blocks until the cleanup process exits.
 func (c *Cache[K, V]) Stop() {
 	c.stopMu.Lock()
-	defer c.stopMu.Unlock()
-
 	if c.stopped {
+		c.stopMu.Unlock()
 		return
 	}
 
-	c.stopCh <- struct{}{}
+	stopCh := c.stopCh
+	wg := &c.stopWG
 	c.stopped = true
+	c.stopMu.Unlock()
 
+	// Non-blocking signal: the running goroutine selects on stopCh.
+	// Closing it also unblocks a goroutine that has not yet reached the
+	// select, because Start captured this same channel.
+	close(stopCh)
+
+	// Block until the running cleanup goroutine exits so a subsequent
+	// Start cannot race an exiting one.
+	wg.Wait()
+
+	c.stopMu.Lock()
+	// Fresh channel for the next Start; the closed one is replaced
+	// after no goroutine can reference it anymore.
+	c.stopCh = make(chan struct{}, 1)
+	c.stopMu.Unlock()
 }
 
 // OnInsertion adds the provided function to be executed when

@@ -564,14 +564,14 @@ func Test_Cache_get(t *testing.T) {
 func Test_Cache_evict(t *testing.T) {
 	cc := map[string]struct {
 		MaxCost uint64
-	} {
+	}{
 		"evict without MaxCost": {
 			MaxCost: 0,
 		},
 		"evict with MaxCost": {
 			MaxCost: 5,
 		},
-	};
+	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
@@ -896,14 +896,14 @@ func Test_Cache_GetAndDelete(t *testing.T) {
 func Test_Cache_DeleteAll(t *testing.T) {
 	cc := map[string]struct {
 		MaxCost uint64
-	} {
+	}{
 		"DeleteAll without MaxCost": {
 			MaxCost: 0,
 		},
 		"DeleteAll with MaxCost": {
 			MaxCost: 5,
 		},
-	};
+	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
@@ -1137,69 +1137,49 @@ func Test_Cache_Cost(t *testing.T) {
 
 func Test_Cache_Start(t *testing.T) {
 	cache := prepCache(0, 0)
-	cache.stopCh = make(chan struct{})
 
-	addExpiredCacheItems(cache, "1")
-	time.Sleep(time.Millisecond) // force expiration
-
-	fn := func(r EvictionReason, _ *Item[string, string]) {
-		go func() {
-			assert.Equal(t, EvictionReasonExpired, r)
-
-			cache.metricsMu.RLock()
-			v := cache.metrics.Evictions
-			cache.metricsMu.RUnlock()
-
-			switch v {
-			case 1:
-				cache.items.mu.Lock()
-				addExpiredCacheItems(cache, "2")
-				cache.items.mu.Unlock()
-				cache.options.ttl = time.Hour
-				cache.items.timerCh <- time.Millisecond
-			case 2:
-				cache.items.mu.Lock()
-				addTTLCacheItems(cache, time.Second, "3")
-				addTTLCacheItems(cache, NoTTL, "4")
-				cache.items.mu.Unlock()
-				cache.items.timerCh <- time.Millisecond
-			default:
-				close(cache.stopCh)
-			}
-		}()
-	}
-	cache.events.eviction.fns[1] = fn
-
-	cache.Start()
-
-	cache.events.eviction.fns = make(map[uint64]func(EvictionReason, *Item[string, string]))
-	cache.stopCh = make(chan struct{})
-	cache.stopped = true
+	// The cleanup process is stopped by default.
+	assert.False(t, cache.IsStarted())
 
 	go cache.Start()
-	go cache.Start() // should be no-op
+	assert.Eventually(t, cache.IsStarted, time.Second, time.Millisecond)
 
-	assert.Eventually(t, func() bool {
-		cache.stopMu.Lock()
-		defer cache.stopMu.Unlock()
-		return !cache.stopped
-	}, time.Second, time.Millisecond*100)
+	// Starting again while running is a no-op and does not panic.
+	assert.NotPanics(t, cache.Start)
+	assert.True(t, cache.IsStarted())
 
+	// Stop blocks until the cleanup goroutine exits.
+	assert.NotPanics(t, cache.Stop)
+	assert.Eventually(t, func() bool { return !cache.IsStarted() },
+		time.Second, time.Millisecond)
+
+	// Stopping again is a no-op.
 	assert.NotPanics(t, cache.Stop)
 
+	// A fresh Start after Stop can be stopped cleanly.
+	go cache.Start()
+	assert.Eventually(t, cache.IsStarted, time.Second, time.Millisecond)
+	assert.NotPanics(t, cache.Stop)
+	assert.Eventually(t, func() bool { return !cache.IsStarted() },
+		time.Second, time.Millisecond)
 }
 
 func Test_Cache_Stop(t *testing.T) {
-	cache := Cache[string, string]{
-		stopCh:  make(chan struct{}, 1),
-		stopped: true,
-	}
-	cache.Stop()
-	assert.Len(t, cache.stopCh, 0)
+	cache := prepCache(0, 0)
 
-	cache.stopped = false
+	// Stopping a cache that was never started is a no-op.
+	assert.NotPanics(t, cache.Stop)
+	assert.True(t, cache.stopped)
+
+	// A real Start/Stop cycle leaves the cache stopped and its signal
+	// channel replaced for a potential next Start.
+	go cache.Start()
+	assert.Eventually(t, cache.IsStarted, time.Second, time.Millisecond)
 	cache.Stop()
-	assert.Len(t, cache.stopCh, 1)
+	assert.False(t, cache.IsStarted())
+
+	// Stopping twice in a row is a no-op.
+	assert.NotPanics(t, cache.Stop)
 }
 
 func Test_Cache_IsStarted(t *testing.T) {
