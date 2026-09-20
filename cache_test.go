@@ -564,14 +564,14 @@ func Test_Cache_get(t *testing.T) {
 func Test_Cache_evict(t *testing.T) {
 	cc := map[string]struct {
 		MaxCost uint64
-	} {
+	}{
 		"evict without MaxCost": {
 			MaxCost: 0,
 		},
 		"evict with MaxCost": {
 			MaxCost: 5,
 		},
-	};
+	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
@@ -896,14 +896,14 @@ func Test_Cache_GetAndDelete(t *testing.T) {
 func Test_Cache_DeleteAll(t *testing.T) {
 	cc := map[string]struct {
 		MaxCost uint64
-	} {
+	}{
 		"DeleteAll without MaxCost": {
 			MaxCost: 0,
 		},
 		"DeleteAll with MaxCost": {
 			MaxCost: 5,
 		},
-	};
+	}
 
 	for cn, c := range cc {
 		t.Run(cn, func(t *testing.T) {
@@ -1137,6 +1137,7 @@ func Test_Cache_Cost(t *testing.T) {
 
 func Test_Cache_Start(t *testing.T) {
 	cache := prepCache(0, 0)
+	cache.stopCond = sync.NewCond(&cache.stopMu)
 	cache.stopCh = make(chan struct{})
 
 	addExpiredCacheItems(cache, "1")
@@ -1173,11 +1174,17 @@ func Test_Cache_Start(t *testing.T) {
 	cache.Start()
 
 	cache.events.eviction.fns = make(map[uint64]func(EvictionReason, *Item[string, string]))
-	cache.stopCh = make(chan struct{})
-	cache.stopped = true
 
-	go cache.Start()
-	go cache.Start() // should be no-op
+	var startWg sync.WaitGroup
+	startWg.Add(2)
+	go func() {
+		defer startWg.Done()
+		cache.Start()
+	}()
+	go func() {
+		defer startWg.Done()
+		cache.Start() // should be no-op
+	}()
 
 	assert.Eventually(t, func() bool {
 		cache.stopMu.Lock()
@@ -1186,20 +1193,22 @@ func Test_Cache_Start(t *testing.T) {
 	}, time.Second, time.Millisecond*100)
 
 	assert.NotPanics(t, cache.Stop)
+	startWg.Wait()
 
 }
 
 func Test_Cache_Stop(t *testing.T) {
-	cache := Cache[string, string]{
-		stopCh:  make(chan struct{}, 1),
-		stopped: true,
-	}
-	cache.Stop()
-	assert.Len(t, cache.stopCh, 0)
+	cache := New[string, string]()
 
-	cache.stopped = false
-	cache.Stop()
-	assert.Len(t, cache.stopCh, 1)
+	// Stopping a cache whose cleaner was never started is a no-op.
+	assert.NotPanics(t, cache.Stop)
+
+	go cache.Start()
+	assert.Eventually(t, cache.IsStarted, time.Second, time.Millisecond*100)
+
+	// Stop blocks until the cleaner actually exited.
+	assert.NotPanics(t, cache.Stop)
+	assert.False(t, cache.IsStarted())
 }
 
 func Test_Cache_IsStarted(t *testing.T) {

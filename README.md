@@ -175,6 +175,81 @@ func main() {
 }
 ```
 
+Multiple keys can be retrieved in one call with `GetMany`. It accepts
+an ordered list of keys, optional per-entry options (same semantics as
+`Get`), and a maximum concurrency for loads of missing keys, and
+returns one result per input position (`Item`, miss, or load error):
+```go
+func main() {
+	loader := ttlcache.NewSuppressedLoader(
+		ttlcache.ContextLoaderFunc[string, string](
+			func(ctx context.Context, c *ttlcache.Cache[string, string], key string) (string, time.Duration, error) {
+				// ctx is detached from the caller: a canceled waiter
+				// does not cancel a load shared with other callers.
+				value, err := loadFromFile(ctx, key)
+				return value, ttlcache.DefaultTTL, err
+			},
+		),
+		nil,
+	)
+	cache := ttlcache.New[string, string](
+		ttlcache.WithLoader[string, string](loader),
+		ttlcache.WithGenerationGuard[string, string](),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	results := cache.GetMany(ctx, []string{"a", "b", "c", "a"}, nil, 4)
+	for _, result := range results {
+		if result.Err != nil {
+			// load error, or the context error when the load did not start
+			log.Println(result.Key, result.Err)
+			continue
+		}
+		if !result.Hit() {
+			// genuine miss: the loader found nothing
+			continue
+		}
+
+		log.Println(result.Key, result.Item.Value())
+	}
+}
+```
+
+`GetMany` semantics:
+- **Snapshot at call start.** All distinct keys are looked up, touched,
+  and counted as hits/misses under a single cache-lock acquisition, in
+  the order of their first occurrence. Repeated keys perform one lookup
+  and at most one load; the same result is copied to every position.
+- **Decisions at completion.** Everything load completions decide,
+  namely insertion/update/eviction events and their order and capacity
+  or cost eviction, happens as loads finish, exactly as if the
+  equivalent `Get` calls completed in that order.
+- **Cancellation.** When the context is canceled, no new loads start
+  and their positions report the context error. Loads that already
+  started always run to completion, and a load shared with other
+  callers is never terminated by one waiter leaving.
+
+### Generation guard
+Without further configuration the cache keeps the historical,
+compatible semantics: a slow load may overwrite a concurrent `Set`,
+and `DeleteAll` does not prevent in-flight loads from reinserting
+their values (this applies to any loader that inserts items itself,
+including `LoaderFunc` and `Loader` implementations).
+
+Enable the guard with `ttlcache.WithGenerationGuard()`. The cache
+generation then advances on `DeleteAll`, on `ResetGeneration`, and
+when `Start` is called after `Stop`. A `ContextLoader` captures the
+generation when its load starts; on completion the value is committed
+only when the generation is unchanged and the key was not `Set`,
+deleted, or evicted in the meantime. A stale value is still returned
+to the callers that waited for the load, but it is never written to
+the current cache. Plain `Loader` implementations insert items
+themselves, so they retain the legacy behavior even with the guard
+enabled; use `ContextLoader` (or `ContextLoaderFunc`) for guarded
+loads.
+
 The cache's capacity can also be restricted by criteria other than the
 number of items. The `ttlcache.WithMaxCost()` option assigns each item
 a cost, calculated by a custom function, and evicts the least recently

@@ -36,6 +36,11 @@ type Cache[K comparable, V any] struct {
 		expQueue expirationQueue[K, V]
 
 		timerCh chan time.Duration
+
+		// generation is advanced by DeleteAll, ResetGeneration, and
+		// by a Start that follows a Stop when the generation guard is
+		// enabled. It is guarded by the items mutex.
+		generation uint64
 	}
 	cost uint64
 
@@ -60,9 +65,15 @@ type Cache[K comparable, V any] struct {
 		}
 	}
 
-	stopMu  sync.Mutex
-	stopCh  chan struct{}
-	stopped bool
+	stopMu   sync.Mutex
+	stopCond *sync.Cond
+	stopCh   chan struct{}
+	stopped  bool
+	stopping bool
+
+	// startedOnce reports whether Start was ever called. It allows
+	// the generation guard to advance only on restarts.
+	startedOnce bool
 
 	options options[K, V]
 }
@@ -73,6 +84,7 @@ func New[K comparable, V any](opts ...Option[K, V]) *Cache[K, V] {
 		stopCh:  make(chan struct{}),
 		stopped: true, // cache cleanup process is stopped by default
 	}
+	c.stopCond = sync.NewCond(&c.stopMu)
 	c.items.values = make(map[K]*list.Element)
 	c.items.lru = list.New()
 	c.items.expQueue = newExpirationQueue[K, V]()
@@ -283,7 +295,8 @@ func (c *Cache[K, V]) getWithOpts(key K, lockAndLoad bool, opts ...Option[K, V])
 		c.metricsMu.Unlock()
 
 		if lockAndLoad && getOpts.loader != nil {
-			return getOpts.loader.Load(c, key)
+			item, _ := c.loadItem(context.Background(), key, getOpts.loader)
+			return item
 		}
 
 		return nil
@@ -468,7 +481,7 @@ func (c *Cache[K, V]) GetAndDelete(key K, opts ...Option[K, V]) (*Item[K, V], bo
 		getOpts = applyOptions(getOpts, opts...) // used only to update the loader
 
 		if getOpts.loader != nil {
-			item := getOpts.loader.Load(c, key)
+			item, _ := c.loadItem(context.Background(), key, getOpts.loader)
 			return item, item != nil
 		}
 
@@ -484,8 +497,38 @@ func (c *Cache[K, V]) GetAndDelete(key K, opts ...Option[K, V]) (*Item[K, V], bo
 // DeleteAll deletes all items from the cache.
 func (c *Cache[K, V]) DeleteAll() {
 	c.items.mu.Lock()
+	if c.options.enableGenerationGuard {
+		c.items.generation++
+	}
 	c.evict(EvictionReasonDeleted)
 	c.items.mu.Unlock()
+}
+
+// ResetGeneration advances the cache generation without removing any
+// items. It has an effect only when the generation guard is enabled
+// (see WithGenerationGuard).
+//
+// Loads that started before the call still deliver their value to the
+// callers waiting for them, but their result is not inserted into the
+// cache, even if no items were deleted. This is useful for signaling
+// that externally cached data has been invalidated wholesale.
+func (c *Cache[K, V]) ResetGeneration() {
+	if !c.options.enableGenerationGuard {
+		return
+	}
+
+	c.items.mu.Lock()
+	c.items.generation++
+	c.items.mu.Unlock()
+}
+
+// Generation returns the current cache generation. The value is only
+// meaningful when the generation guard is enabled.
+func (c *Cache[K, V]) Generation() uint64 {
+	c.items.mu.RLock()
+	defer c.items.mu.RUnlock()
+
+	return c.items.generation
 }
 
 // DeleteExpired deletes all expired items from the cache.
@@ -684,7 +727,19 @@ func (c *Cache[K, V]) Start() {
 		return
 	}
 
+	if c.startedOnce && c.options.enableGenerationGuard {
+		// Start after a Stop begins a new cache generation so that
+		// loads started before the shutdown cannot repopulate the
+		// restarted cache.
+		c.items.mu.Lock()
+		c.items.generation++
+		c.items.mu.Unlock()
+	}
+	c.startedOnce = true
+
 	c.stopped = false
+	stopCh := make(chan struct{})
+	c.stopCh = stopCh
 	c.stopMu.Unlock()
 
 	waitDur := func() time.Duration {
@@ -724,7 +779,12 @@ func (c *Cache[K, V]) Start() {
 
 	for {
 		select {
-		case <-c.stopCh:
+		case <-stopCh:
+			c.stopMu.Lock()
+			c.stopped = true
+			c.stopping = false
+			c.stopCond.Broadcast()
+			c.stopMu.Unlock()
 			return
 		case d := <-c.items.timerCh:
 			stop()
@@ -747,9 +807,14 @@ func (c *Cache[K, V]) Stop() {
 		return
 	}
 
-	c.stopCh <- struct{}{}
-	c.stopped = true
+	c.stopping = true
+	c.stopMu.Unlock()
 
+	close(c.stopCh)
+	c.stopMu.Lock()
+	for c.stopping {
+		c.stopCond.Wait()
+	}
 }
 
 // OnInsertion adds the provided function to be executed when
@@ -936,4 +1001,47 @@ func (l *SuppressedLoader[K, V]) Load(c *Cache[K, V], key K) *Item[K, V] {
 	}
 
 	return res.(*Item[K, V])
+}
+
+// LoadContext suppresses duplicate context-aware loads in the same
+// singleflight group that Load uses, so a GetMany and a concurrent Get
+// share one execution for a given key.
+//
+// Capture, execution, and the cache commit happen once inside the
+// singleflight leader, so followers never insert a second copy. When
+// the wrapped loader only implements Loader, its legacy self-inserting
+// behavior is preserved. The context is detached from callers before
+// reaching the loader, so a single canceled waiter cannot start a new
+// singleflight round or terminate a shared load.
+func (l *SuppressedLoader[K, V]) LoadContext(ctx context.Context, c *Cache[K, V], key K) (V, time.Duration, error) {
+	var zero V
+
+	item, err := l.loadSuppressed(ctx, c, key)
+	if err != nil {
+		return zero, DefaultTTL, err
+	}
+
+	if item == nil {
+		return zero, DefaultTTL, nil
+	}
+
+	return item.Value(), item.ttl, nil
+}
+
+// loadSuppressed runs the wrapped loader in the singleflight group so
+// concurrent callers share one generation capture, one load, and one
+// cache commit. Every waiter receives the same outcome: the committed
+// item, a transient item the generation guard refused to store, nil
+// for a genuine miss, or the load error.
+func (l *SuppressedLoader[K, V]) loadSuppressed(ctx context.Context, c *Cache[K, V], key K) (*Item[K, V], error) {
+	strKey := fmt.Sprint(key)
+	res, err, _ := l.group.Do(strKey, func() (interface{}, error) {
+		return c.executeSuppressedLoad(ctx, key, l.loader)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	item, _ := res.(*Item[K, V])
+	return item, nil
 }

@@ -21,12 +21,13 @@ type CostFunc[K comparable, V any] func(item CostItem[K, V]) uint64
 
 // options holds all available cache configuration options.
 type options[K comparable, V any] struct {
-	capacity          uint64
-	maxCost           uint64
-	ttl               time.Duration
-	loader            Loader[K, V]
-	disableTouchOnHit bool
-	itemOpts          []ItemOption[K, V]
+	capacity              uint64
+	maxCost               uint64
+	ttl                   time.Duration
+	loader                Loader[K, V]
+	disableTouchOnHit     bool
+	enableGenerationGuard bool
+	itemOpts              []ItemOption[K, V]
 }
 
 // applyOptions applies the provided option values to the option struct
@@ -85,6 +86,30 @@ func WithLoader[K comparable, V any](l Loader[K, V]) Option[K, V] {
 func WithDisableTouchOnHit[K comparable, V any]() Option[K, V] {
 	return optionFunc[K, V](func(opts options[K, V]) options[K, V] {
 		opts.disableTouchOnHit = true
+		return opts
+	})
+}
+
+// WithGenerationGuard enables the generation guard.
+//
+// When enabled, the cache generation advances on DeleteAll, on
+// ResetGeneration, and whenever Start is called after Stop. A load
+// performed through a ContextLoader (see GetMany) captures the
+// generation when it starts and, on completion, commits its value
+// only when the generation is unchanged and the key was not Set,
+// deleted, or evicted in the meantime. A stale value is still
+// returned to the callers that waited for the load, but it is never
+// written to the cache.
+//
+// When disabled, loads use the legacy last-write-wins semantics: a
+// slow load may overwrite a concurrent Set, and DeleteAll does not
+// prevent in-flight loads from reinserting their values. Plain
+// Loader implementations always self-insert, so they retain those
+// legacy semantics even with the guard enabled; use a ContextLoader
+// for guarded loads.
+func WithGenerationGuard[K comparable, V any]() Option[K, V] {
+	return optionFunc[K, V](func(opts options[K, V]) options[K, V] {
+		opts.enableGenerationGuard = true
 		return opts
 	})
 }
